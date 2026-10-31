@@ -1,0 +1,154 @@
+name: PR 189054 native sign-in focus proof
+
+on:
+  push:
+    branches: [proof/macos-signin-189054]
+
+permissions:
+  contents: read
+
+jobs:
+  native-proof:
+    name: Native focus (${{ matrix.variant }})
+    runs-on: xcode-27
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [base, fixed]
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+    env:
+      PROOF_HEAD: 2cdbac7e61e8937cc15dd15d57291e1aa1007a16
+      PROOF_BASE: 95b5fa5fb78d1c39c0bd364ee3dc9f37a1750c1c
+      PROOF_VARIANT: ${{ matrix.variant }}
+    steps:
+      - name: Check out the exact PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 2cdbac7e61e8937cc15dd15d57291e1aa1007a16
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Select the existing CI toolchain and record source
+        run: |
+          mkdir -p proof
+          source scripts/lib/swift-toolchain.sh
+          select_xcode_toolchain
+          require_swift_toolchain
+          test "$(git rev-parse HEAD)" = "$PROOF_HEAD"
+          test "$(git rev-parse HEAD^)" = "$PROOF_BASE"
+          {
+            sw_vers
+            xcodebuild -version
+            swift --version
+            git rev-parse HEAD HEAD^
+            printf 'variant=%s\n' "$PROOF_VARIANT"
+          } > proof/environment.txt
+          if [[ "$PROOF_VARIANT" == base ]]; then
+            for file in apps/macos/Sources/OpenClaw/DashboardManager+Construction.swift apps/macos/Sources/OpenClaw/DashboardWindowController.swift; do
+              git show "$PROOF_BASE:$file" > "$file"
+            done
+          fi
+          git diff -- apps/macos > proof/source-control.diff
+          git diff --exit-code -- apps/macos/Tests
+          shasum -a 256 apps/macos/Sources/OpenClaw/DashboardManager+Construction.swift apps/macos/Sources/OpenClaw/DashboardWindowController.swift apps/macos/Tests/OpenClawIPCTests/DashboardGatewaysTests.swift > proof/source-sha256.txt
+
+      - name: Set up Node and pnpm
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "24.22.1"
+          install-bun: "false"
+          install-deps: "false"
+          cache-mode: "off"
+
+      - name: Prepare the normal native build dependencies
+        run: |
+          pnpm install --frozen-lockfile --prefer-offline --optional \
+            --filter '@openclaw/mermaid-renderer...' \
+            --filter '@openclaw/gateway-protocol...' --filter 'openclaw...' \
+            --config.ignore-scripts=false --config.engine-strict=false \
+            --config.enable-pre-post-scripts=true --config.side-effects-cache=true
+          node scripts/prepare-apple-mermaid.mjs
+
+      - name: Compile the actual application and native test bundle
+        run: |
+          swift build --package-path apps/macos --build-system native \
+            --enable-code-coverage --disable-index-store -Xswiftc -gline-tables-only \
+            --build-tests --jobs 2 --disable-keychain --disable-netrc \
+            > proof/build.log 2>&1 || { tail -100 proof/build.log; exit 1; }
+          tail -20 proof/build.log
+
+      - name: Preserve the launcher's test event stream for independent inspection
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          source = Path('scripts/test-macos-native.mts').read_text()
+          marker = '      // Export synthetic images after every child/output closes and before resource cleanup.'
+          assert source.count(marker) == 1
+          export = '      fs.copyFileSync(eventStreamPath, path.join(env.RUNNER_TEMP ?? "", "signin-focus-events.jsonl"));\n'
+          Path('scripts/test-macos-native-proof.mts').write_text(source.replace(marker, export + marker))
+          Path('proof/launcher-change.txt').write_text(export)
+          PY
+
+      - name: Run both pending sign-in focus entry paths
+        run: |
+          result=0
+          node scripts/test-macos-native-proof.mts default \
+            --package-path apps/macos --build-system native --enable-code-coverage \
+            --disable-index-store -Xswiftc -gline-tables-only --skip-build --no-parallel \
+            --filter 'pending browser sign-in survives gateway focus' \
+            > proof/focus.log 2>&1 || result=$?
+          printf '%s\n' "$result" > proof/focus-exit-code.txt
+          if [[ -f "$RUNNER_TEMP/signin-focus-events.jsonl" ]]; then
+            cp "$RUNNER_TEMP/signin-focus-events.jsonl" proof/focus-events.jsonl
+          fi
+          cat proof/focus.log
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          rows = [json.loads(line) for line in Path('proof/focus-events.jsonl').read_text().splitlines()]
+          events = [row['payload'] for row in rows if row.get('kind') == 'event']
+          name = 'pending browser sign-in survives gateway focus'
+          assert any(e.get('kind') == 'testStarted' and name in e.get('testID', '') for e in events)
+          assert any(e.get('kind') == 'testEnded' and name in e.get('testID', '') for e in events)
+          assert any(e.get('kind') == 'runEnded' for e in events)
+          code = int(Path('proof/focus-exit-code.txt').read_text())
+          log = Path('proof/focus.log').read_text()
+          assert '[macos-native] retained resources' not in log
+          assert '[macos-native] security delete-keychain failed' not in log
+          if os.environ['PROOF_VARIANT'] == 'base':
+              assert code != 0
+              assert 'Focusing a pending sign-in must not resolve another endpoint' in log
+              print('BASE: expected product assertion failure through the native focus entry point')
+          else:
+              assert code == 0
+              print('FIXED: native pending-focus regression passed')
+          PY
+
+      - name: Run the existing healthy focus sibling on the fixed head
+        if: matrix.variant == 'fixed'
+        run: |
+          node scripts/test-macos-native-proof.mts default \
+            --package-path apps/macos --build-system native --enable-code-coverage \
+            --disable-index-store -Xswiftc -gline-tables-only --skip-build --no-parallel \
+            --filter 'healthy browser gateway focus preserves document' \
+            > proof/healthy.log 2>&1 || { cat proof/healthy.log; exit 1; }
+          cp "$RUNNER_TEMP/signin-focus-events.jsonl" proof/healthy-events.jsonl
+          cat proof/healthy.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          rows = [json.loads(line) for line in Path('proof/healthy-events.jsonl').read_text().splitlines()]
+          events = [row['payload'] for row in rows if row.get('kind') == 'event']
+          assert any(e.get('kind') == 'testEnded' and 'healthy browser gateway focus preserves document' in e.get('testID', '') for e in events)
+          PY
+
+      - name: Upload exact-source build and test evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: macos-signin-189054-${{ matrix.variant }}-${{ github.run_id }}
+          path: proof/
+          retention-days: 14
